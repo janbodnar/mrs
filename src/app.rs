@@ -633,11 +633,7 @@ impl EditorApp {
         if let Some(dir) = &self.last_dir {
             dialog = dialog.set_directory(dir);
         }
-        let path = dialog.save_file();
-        if let Some(path) = &path {
-            self.last_dir = path.parent().map(Path::to_path_buf);
-        }
-        path
+        dialog.save_file()
     }
 
     fn reset_zoom(&mut self) {
@@ -2212,6 +2208,70 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_editor(path: Option<PathBuf>, text: &str) -> EditorApp {
+        EditorApp {
+            text: text.to_owned(),
+            saved_text: "saved".to_owned(),
+            path,
+            encoding: Encoding::Utf8,
+            eol: Eol::Lf,
+            disk_fingerprint: None,
+            stats: TextStats::compute(text),
+            stats_revision: 0,
+            revision: 0,
+            font_size: BASE_FONT_SIZE,
+            cursor_char: 0,
+            cursor_line: 1,
+            cursor_col: 1,
+            selection_len: 0,
+            find: FindState::default(),
+            goto: None,
+            palette: PaletteState::default(),
+            pending_palette: None,
+            editor_panel_rect: egui::Rect::NOTHING,
+            show_guide: true,
+            show_status_bar: true,
+            show_help: false,
+            pending: None,
+            error: None,
+            conflict: None,
+            pending_cursor: None,
+            notice: None,
+            focus_editor: false,
+            scroll_to_top: false,
+            allow_close: false,
+            modal_was_open: false,
+            restore_pending: false,
+            title: String::new(),
+            last_dir: None,
+        }
+    }
+
+    #[test]
+    fn failed_save_as_keeps_document_identity() {
+        let dir = TempDir::new();
+        let original = dir.path().join("original.txt");
+        std::fs::write(&original, b"saved").unwrap();
+        let missing = dir.path().join("missing-directory").join("new.txt");
+        let fingerprint = Fingerprint::of(b"saved");
+        let ctx = egui::Context::default();
+
+        // Both a clean buffer and a modified one must keep the old path, the
+        // saved snapshot and the disk fingerprint when the write fails.
+        for text in ["saved", "edited"] {
+            let mut app = test_editor(Some(original.clone()), text);
+            app.disk_fingerprint = Some(fingerprint);
+
+            assert!(!app.save_to_path(&ctx, missing.clone(), false, None));
+
+            assert_eq!(app.path.as_deref(), Some(original.as_path()));
+            assert_eq!(app.saved_text, "saved");
+            assert_eq!(app.disk_fingerprint, Some(fingerprint));
+            assert_eq!(app.is_modified(), text != "saved");
+            assert!(app.error.is_some());
         }
     }
 
