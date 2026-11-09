@@ -268,6 +268,8 @@ pub struct EditorApp {
     /// Palette commands run at the start of the next frame, before the editor
     /// widget, so injected events (e.g. Delete Line) are handled by it.
     pending_palette: Option<PaletteCommand>,
+    /// Where the editor panel was drawn last frame; the palette aligns to it.
+    editor_panel_rect: egui::Rect,
     show_guide: bool,
     show_status_bar: bool,
     show_help: bool,
@@ -309,6 +311,7 @@ impl EditorApp {
             goto: None,
             palette: PaletteState::default(),
             pending_palette: None,
+            editor_panel_rect: egui::Rect::NOTHING,
             show_guide: true,
             show_status_bar: true,
             show_help: false,
@@ -854,7 +857,14 @@ impl EditorApp {
 
         let id = Id::unique("command_palette");
         let input_id = Id::unique("palette_input");
-        let width = (ctx.content_rect().width() - 80.0).clamp(320.0, 560.0);
+        let panel = self.editor_panel_rect;
+        let inset = 18.0;
+        let width = (panel.width() - 2.0 * inset).clamp(280.0, 560.0);
+        let anchor = vec2(panel.left() + inset, panel.top() + 12.0);
+        let content = ctx.content_rect();
+        let max_height = (content.height() * 0.30)
+            .clamp(90.0, 225.0)
+            .min((content.bottom() - anchor.y - 110.0).max(90.0));
         let needle = self.palette.query.trim().to_lowercase();
         let matches: Vec<usize> = PALETTE_COMMANDS
             .iter()
@@ -871,7 +881,7 @@ impl EditorApp {
 
         let mut chosen = None;
         let modal = egui::Modal::new(id)
-            .area(egui::Modal::default_area(id).anchor(Align2::CENTER_TOP, vec2(0.0, 72.0)))
+            .area(egui::Modal::default_area(id).anchor(Align2::LEFT_TOP, anchor))
             .backdrop_color(Color32::from_black_alpha(80))
             .frame(
                 egui::Frame::NONE
@@ -898,6 +908,7 @@ impl EditorApp {
                 } else if down && !matches.is_empty() {
                     self.palette.selected = (self.palette.selected + 1).min(matches.len() - 1);
                 }
+                let moved = up || down;
 
                 let response = ui.add(
                     TextEdit::singleline(&mut self.palette.query)
@@ -907,7 +918,9 @@ impl EditorApp {
                         .font(FontId::proportional(14.5))
                         .hint_text("Type the name of a command"),
                 );
-                if response.changed() {
+                let query_changed = response.changed();
+                let opened = self.palette.focus;
+                if query_changed {
                     self.palette.selected = 0;
                 }
                 if self.palette.focus {
@@ -924,53 +937,65 @@ impl EditorApp {
                     .hline(line.x_range(), line.top(), Stroke::new(1.0, theme::BORDER));
                 ui.add_space(5.0);
 
-                if matches.is_empty() {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("No matching commands")
-                            .size(12.0)
-                            .color(theme::FAINT),
-                    );
-                    ui.add_space(8.0);
-                } else {
-                    for (position, &index) in matches.iter().enumerate() {
-                        let entry = &PALETTE_COMMANDS[index];
-                        let (rect, row) = ui.allocate_exact_size(
-                            vec2(ui.available_width(), 30.0),
-                            egui::Sense::click(),
+                let mut list = egui::ScrollArea::vertical()
+                    .id_salt("palette_list")
+                    .max_height(max_height)
+                    .auto_shrink([false, true]);
+                if query_changed || opened {
+                    list = list.vertical_scroll_offset(0.0);
+                }
+                list.show(ui, |ui| {
+                    if matches.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("No matching commands")
+                                .size(12.0)
+                                .color(theme::FAINT),
                         );
-                        if row.hovered() {
-                            self.palette.selected = position;
-                        }
-                        if position == self.palette.selected {
-                            ui.painter().rect_filled(
-                                rect.shrink2(vec2(0.0, 1.0)),
-                                egui::CornerRadius::same(6),
-                                theme::HOVER_BG,
+                        ui.add_space(8.0);
+                    } else {
+                        for (position, &index) in matches.iter().enumerate() {
+                            let entry = &PALETTE_COMMANDS[index];
+                            let (rect, row) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), 30.0),
+                                egui::Sense::click(),
                             );
-                        }
-                        let painter = ui.painter();
-                        painter.text(
-                            rect.left_center() + vec2(10.0, 0.0),
-                            Align2::LEFT_CENTER,
-                            entry.label,
-                            FontId::proportional(13.5),
-                            theme::TEXT,
-                        );
-                        if !entry.hint.is_empty() {
+                            if row.hovered() {
+                                self.palette.selected = position;
+                            }
+                            if position == self.palette.selected {
+                                ui.painter().rect_filled(
+                                    rect.shrink2(vec2(0.0, 1.0)),
+                                    egui::CornerRadius::same(6),
+                                    theme::HOVER_BG,
+                                );
+                                if moved {
+                                    row.scroll_to_me(Some(Align::Center));
+                                }
+                            }
+                            let painter = ui.painter();
                             painter.text(
-                                rect.right_center() - vec2(10.0, 0.0),
-                                Align2::RIGHT_CENTER,
-                                entry.hint,
-                                FontId::monospace(11.0),
-                                theme::FAINT,
+                                rect.left_center() + vec2(10.0, 0.0),
+                                Align2::LEFT_CENTER,
+                                entry.label,
+                                FontId::proportional(13.5),
+                                theme::TEXT,
                             );
-                        }
-                        if row.clicked() {
-                            chosen = Some(entry.command);
+                            if !entry.hint.is_empty() {
+                                painter.text(
+                                    rect.right_center() - vec2(10.0, 0.0),
+                                    Align2::RIGHT_CENTER,
+                                    entry.hint,
+                                    FontId::monospace(11.0),
+                                    theme::FAINT,
+                                );
+                            }
+                            if row.clicked() {
+                                chosen = Some(entry.command);
+                            }
                         }
                     }
-                }
+                });
 
                 ui.add_space(4.0);
                 ui.label(
@@ -1302,6 +1327,7 @@ impl EditorApp {
                     pos2(available.center().x - width / 2.0, available.top() + margin),
                     vec2(width, height),
                 );
+                self.editor_panel_rect = panel_rect;
 
                 let painter = ui.painter();
                 let shadow = egui::epaint::Shadow {
