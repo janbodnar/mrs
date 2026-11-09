@@ -483,7 +483,7 @@ impl EditorApp {
 
         let contents = self.eol.encode(&self.text);
         let bytes = self.encoding.encode(&contents);
-        match std::fs::write(&path, bytes) {
+        match crate::save::write_atomic(&path, &bytes) {
             Ok(()) => {
                 self.last_dir = path.parent().map(Path::to_path_buf);
                 self.path = Some(path);
