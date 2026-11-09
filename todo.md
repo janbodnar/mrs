@@ -7,12 +7,12 @@
 - [x] New File (`Ctrl+N`)
 - [x] Save As… (`Ctrl+Shift+S`)
 - [x] Find… (`Ctrl+F`)
-- [ ] Find Next / Previous (`F3` / `Shift+F3`)
+- [x] Find Next / Previous (`F3` / `Shift+F3`)
 - [x] Go to Line… (`Ctrl+L`)
-- [ ] Zoom In / Out / Reset (`Ctrl++` / `Ctrl+-` / `Ctrl+0`)
-- [ ] Copy File Path (`Ctrl+Shift+C`)
-- [ ] Delete Line (`Ctrl+Shift+K`)
-- [ ] Keyboard Shortcuts (`F1`)
+- [x] Zoom In / Out / Reset (`Ctrl++` / `Ctrl+-` / `Ctrl+0`)
+- [x] Copy File Path (`Ctrl+Shift+C`)
+- [x] Delete Line (`Ctrl+Shift+K`)
+- [x] Keyboard Shortcuts (`F1`)
 
 ### Batch 2 — small new features
 

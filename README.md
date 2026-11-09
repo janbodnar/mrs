@@ -12,8 +12,8 @@ A small, dark, menu-less plain-text editor written in Rust with
 - No menu bar. Everything is done with keyboard shortcuts (press **F1** for a
   cheat sheet).
 - VS Code-style command palette (**Ctrl+Shift+P**) with fuzzy-free filtering and
-  the commands new file, open file, save, save as, find, go to line, quit,
-  toggle the vertical guide line and toggle the status bar.
+  commands for new/open/save/save as, find and navigation, copy file path,
+  delete line, zoom, toggles, keyboard shortcuts and quit.
 - Status bar with file name, modified indicator, cursor position, selection
   size, line/word/character counts, line endings (LF/CRLF), encoding
   (UTF-8/UTF-8 BOM) and text zoom.

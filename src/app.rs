@@ -128,9 +128,17 @@ enum PaletteCommand {
     SaveAs,
     Open,
     Find,
+    FindNext,
+    FindPrev,
     Goto,
+    CopyPath,
+    DeleteLine,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
     ToggleGuide,
     ToggleStatusBar,
+    Help,
 }
 
 struct PaletteEntry {
@@ -166,9 +174,44 @@ const PALETTE_COMMANDS: &[PaletteEntry] = &[
         hint: "Ctrl+F",
     },
     PaletteEntry {
+        command: PaletteCommand::FindNext,
+        label: "Find Next",
+        hint: "F3",
+    },
+    PaletteEntry {
+        command: PaletteCommand::FindPrev,
+        label: "Find Previous",
+        hint: "Shift+F3",
+    },
+    PaletteEntry {
         command: PaletteCommand::Goto,
         label: "Go to Line…",
         hint: "Ctrl+L",
+    },
+    PaletteEntry {
+        command: PaletteCommand::CopyPath,
+        label: "Copy File Path",
+        hint: "Ctrl+Shift+C",
+    },
+    PaletteEntry {
+        command: PaletteCommand::DeleteLine,
+        label: "Delete Line",
+        hint: "Ctrl+Shift+K",
+    },
+    PaletteEntry {
+        command: PaletteCommand::ZoomIn,
+        label: "Zoom In",
+        hint: "Ctrl++",
+    },
+    PaletteEntry {
+        command: PaletteCommand::ZoomOut,
+        label: "Zoom Out",
+        hint: "Ctrl+-",
+    },
+    PaletteEntry {
+        command: PaletteCommand::ZoomReset,
+        label: "Reset Zoom",
+        hint: "Ctrl+0",
     },
     PaletteEntry {
         command: PaletteCommand::ToggleGuide,
@@ -179,6 +222,11 @@ const PALETTE_COMMANDS: &[PaletteEntry] = &[
         command: PaletteCommand::ToggleStatusBar,
         label: "Toggle Status Bar",
         hint: "",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Help,
+        label: "Keyboard Shortcuts",
+        hint: "F1",
     },
     PaletteEntry {
         command: PaletteCommand::Quit,
@@ -217,6 +265,9 @@ pub struct EditorApp {
     find: FindState,
     goto: Option<GotoState>,
     palette: PaletteState,
+    /// Palette commands run at the start of the next frame, before the editor
+    /// widget, so injected events (e.g. Delete Line) are handled by it.
+    pending_palette: Option<PaletteCommand>,
     show_guide: bool,
     show_status_bar: bool,
     show_help: bool,
@@ -257,6 +308,7 @@ impl EditorApp {
             find: FindState::default(),
             goto: None,
             palette: PaletteState::default(),
+            pending_palette: None,
             show_guide: true,
             show_status_bar: true,
             show_help: false,
@@ -780,9 +832,17 @@ impl EditorApp {
             }
             PaletteCommand::Open => self.request(ctx, Action::Open),
             PaletteCommand::Find => self.open_find(ctx),
+            PaletteCommand::FindNext => self.find_step(1),
+            PaletteCommand::FindPrev => self.find_step(-1),
             PaletteCommand::Goto => self.open_goto(),
+            PaletteCommand::CopyPath => self.copy_path(ctx),
+            PaletteCommand::DeleteLine => self.delete_line(ctx),
+            PaletteCommand::ZoomIn => self.zoom(1.0),
+            PaletteCommand::ZoomOut => self.zoom(-1.0),
+            PaletteCommand::ZoomReset => self.reset_zoom(),
             PaletteCommand::ToggleGuide => self.show_guide = !self.show_guide,
             PaletteCommand::ToggleStatusBar => self.show_status_bar = !self.show_status_bar,
+            PaletteCommand::Help => self.show_help = true,
         }
         ctx.request_repaint();
     }
@@ -925,7 +985,9 @@ impl EditorApp {
             });
 
         if let Some(command) = chosen {
-            self.run_palette_command(ctx, command);
+            self.palette.open = false;
+            self.pending_palette = Some(command);
+            ctx.request_repaint();
         } else if modal.should_close() {
             self.palette.open = false;
         }
@@ -1595,6 +1657,10 @@ impl eframe::App for EditorApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_close_request(&ctx);
+
+        if let Some(command) = self.pending_palette.take() {
+            self.run_palette_command(&ctx, command);
+        }
 
         let dropped: Option<PathBuf> = ctx.input(|input| {
             input
