@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=mrs
+GenericName=Text Editor
+Comment=A small, dark, menu-less text editor
+Exec=mrs %F
+Icon=mrs
+Terminal=false
+Categories=Utility;TextEditor;
+MimeType=text/plain;text/markdown;application/x-shellscript;
+StartupNotify=true
+StartupWMClass=mrs
+Keywords=text;editor;notepad;mrs;
