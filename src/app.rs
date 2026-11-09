@@ -2,6 +2,7 @@
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Id, Key, KeyboardShortcut, Layout, Margin, Modifiers,
@@ -68,6 +69,9 @@ struct FindState {
     computed_revision: u64,
     computed_query: String,
     computed_case: bool,
+    /// The exact text `matches` was computed from. Highlighting must not use
+    /// these ranges against a different (for example, already edited) buffer.
+    computed_text: Arc<str>,
 }
 
 impl Default for FindState {
@@ -84,6 +88,7 @@ impl Default for FindState {
             computed_revision: u64::MAX,
             computed_query: String::new(),
             computed_case: false,
+            computed_text: Arc::from(""),
         }
     }
 }
@@ -100,6 +105,7 @@ impl FindState {
         self.computed_revision = revision;
         self.computed_query.clone_from(&self.query);
         self.computed_case = self.case_sensitive;
+        self.computed_text = Arc::from(text);
         if self.matches.is_empty() {
             self.current = 0;
         } else {
@@ -1368,16 +1374,23 @@ impl EditorApp {
                     ctx.memory_mut(|memory| memory.request_focus(editor_id()));
                 }
 
-                let matches = if self.find.open {
+                let find_open = self.find.open;
+                let matches = if find_open {
                     self.find.matches.clone()
                 } else {
                     Vec::new()
                 };
+                let matches_text = self.find.computed_text.clone();
                 let current_match = self.find.current;
                 let text_color = theme::TEXT;
                 let layouter_color = text_color;
                 let layouter_font = font_id.clone();
                 let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
+                    let matches = if find_open {
+                        fresh_matches(buffer.as_str(), &matches_text, &matches)
+                    } else {
+                        &[]
+                    };
                     ui.fonts_mut(|fonts| {
                         if matches.is_empty() {
                             fonts.layout(
@@ -1389,7 +1402,7 @@ impl EditorApp {
                         } else {
                             fonts.layout_job(build_job(
                                 buffer.as_str(),
-                                &matches,
+                                matches,
                                 current_match,
                                 &layouter_font,
                                 layouter_color,
@@ -1819,6 +1832,18 @@ fn cursor_rect(galley: &egui::Galley, galley_pos: egui::Pos2, char_index: usize)
     )
 }
 
+/// Match ranges are only valid for the exact text they were computed from.
+/// When egui lays out a buffer that has already been edited in this frame, the
+/// revision has not been bumped yet and `matches` is stale, so no highlight is
+/// safe to apply.
+fn fresh_matches<'a>(
+    text: &str,
+    computed_text: &str,
+    matches: &'a [Range<usize>],
+) -> &'a [Range<usize>] {
+    if text == computed_text { matches } else { &[] }
+}
+
 fn build_job(
     text: &str,
     matches: &[Range<usize>],
@@ -1838,7 +1863,13 @@ fn build_job(
 
     let mut position = 0;
     for (index, found) in matches.iter().enumerate() {
-        if found.start > text.len() || found.end > text.len() || found.start < position {
+        if found.start > found.end
+            || found.start > text.len()
+            || found.end > text.len()
+            || found.start < position
+            || !text.is_char_boundary(found.start)
+            || !text.is_char_boundary(found.end)
+        {
             continue;
         }
         if found.start > position {
@@ -1896,4 +1927,65 @@ fn shortcut_grid(ui: &mut Ui, id: &'static str, rows: &[(&[&str], &str)]) {
                 ui.end_row();
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(text: &str, matches: &[Range<usize>]) -> egui::text::LayoutJob {
+        build_job(
+            text,
+            matches,
+            0,
+            &FontId::monospace(12.0),
+            Color32::WHITE,
+            100.0,
+        )
+    }
+
+    fn range(start: usize, end: usize) -> Range<usize> {
+        start..end
+    }
+
+    fn byte_ranges(job: &egui::text::LayoutJob) -> Vec<Range<usize>> {
+        job.sections
+            .iter()
+            .map(|section| section.byte_range.start.0..section.byte_range.end.0)
+            .collect()
+    }
+
+    #[test]
+    fn stale_match_inside_multibyte_character_is_ignored() {
+        // A stale match from a previous buffer ("a") can be in bounds yet not
+        // lie on a character boundary in the new buffer ("é").
+        let job = job("é", &[range(0, 1)]);
+        assert_eq!(job.text, "é");
+        assert_eq!(byte_ranges(&job), vec![range(0, 2)]);
+    }
+
+    #[test]
+    fn valid_multibyte_match_is_highlighted() {
+        let job = job("aéb", &[range(1, 3)]);
+        assert_eq!(
+            byte_ranges(&job),
+            vec![range(0, 1), range(1, 3), range(3, 4)]
+        );
+        assert_eq!(job.sections[1].format.background, theme::MATCH_CURRENT_BG);
+    }
+
+    #[test]
+    fn reversed_and_out_of_bounds_matches_are_ignored() {
+        let job = job("abc", &[range(2, 1), range(1, 99)]);
+        assert_eq!(job.text, "abc");
+        assert_eq!(byte_ranges(&job), vec![range(0, 3)]);
+    }
+
+    #[test]
+    fn matches_are_dropped_when_the_buffer_changed() {
+        let matches = [Range { start: 0, end: 1 }];
+        assert_eq!(fresh_matches("a", "a", &matches), matches);
+        assert!(fresh_matches("é", "a", &matches).is_empty());
+        assert!(fresh_matches("ab", "a", &matches).is_empty());
+    }
 }
