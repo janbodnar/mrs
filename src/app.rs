@@ -1,5 +1,7 @@
 //! A small, menu-less text editor.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +41,59 @@ enum Choice {
     Save,
     Discard,
     Cancel,
+}
+
+/// Cheap identity for the bytes last read from or written to disk. A save is
+/// refused when the file on disk no longer has this fingerprint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fingerprint {
+    len: u64,
+    hash: u64,
+}
+
+impl Fingerprint {
+    fn of(bytes: &[u8]) -> Self {
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        Self {
+            len: bytes.len() as u64,
+            hash: hasher.finish(),
+        }
+    }
+}
+
+/// Compare the current contents of `path` with the fingerprint recorded when
+/// the document was loaded or last saved.
+fn check_disk_file(path: &Path, expected: Fingerprint) -> Result<Option<ConflictReason>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok((Fingerprint::of(&bytes) != expected).then_some(ConflictReason::Changed)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Some(ConflictReason::Deleted)),
+        Err(err) => Err(format!(
+            "Cannot check “{}” before saving.\n{err}",
+            path.display()
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConflictReason {
+    Changed,
+    Deleted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConflictChoice {
+    Overwrite,
+    Reload,
+    SaveAs,
+    Cancel,
+}
+
+struct SaveConflict {
+    path: PathBuf,
+    reason: ConflictReason,
+    /// The action that started this save, if any, to run after resolution.
+    then: Option<Action>,
 }
 
 struct PendingCursor {
@@ -255,6 +310,8 @@ pub struct EditorApp {
     path: Option<PathBuf>,
     encoding: Encoding,
     eol: Eol,
+    /// Fingerprint of the bytes that were last loaded from or saved to `path`.
+    disk_fingerprint: Option<Fingerprint>,
 
     stats: TextStats,
     stats_revision: u64,
@@ -281,6 +338,7 @@ pub struct EditorApp {
     show_help: bool,
     pending: Option<Action>,
     error: Option<String>,
+    conflict: Option<SaveConflict>,
     pending_cursor: Option<PendingCursor>,
     notice: Option<Notice>,
 
@@ -305,6 +363,7 @@ impl EditorApp {
             path: None,
             encoding: Encoding::Utf8,
             eol: Eol::Lf,
+            disk_fingerprint: None,
             stats: TextStats::compute(""),
             stats_revision: 0,
             revision: 0,
@@ -323,6 +382,7 @@ impl EditorApp {
             show_help: false,
             pending: None,
             error: None,
+            conflict: None,
             pending_cursor: None,
             notice: None,
             focus_editor: true,
@@ -358,7 +418,11 @@ impl EditorApp {
     }
 
     fn dialog_open(&self) -> bool {
-        self.pending.is_some() || self.error.is_some() || self.show_help || self.palette.open
+        self.pending.is_some()
+            || self.error.is_some()
+            || self.conflict.is_some()
+            || self.show_help
+            || self.palette.open
     }
 
     /// Give keyboard focus back to whatever was being edited before a dialog
@@ -409,6 +473,7 @@ impl EditorApp {
         self.path = None;
         self.encoding = Encoding::Utf8;
         self.eol = Eol::Lf;
+        self.disk_fingerprint = None;
         self.revision = self.revision.wrapping_add(1);
         self.stats = TextStats::compute("");
         self.stats_revision = self.revision;
@@ -421,6 +486,7 @@ impl EditorApp {
         self.cursor_line = 1;
         self.cursor_col = 1;
         self.selection_len = 0;
+        self.conflict = None;
         self.reset_editor_state(ctx);
     }
 
@@ -429,17 +495,20 @@ impl EditorApp {
         let result = std::fs::read(&path)
             .map_err(|err| format!("Cannot open “{}”.\n{err}", path.display()))
             .and_then(|bytes| {
+                let fingerprint = Fingerprint::of(&bytes);
                 Encoding::decode(&bytes)
+                    .map(|(raw, encoding)| (raw, encoding, fingerprint))
                     .map_err(|err| format!("Cannot open “{}”.\n{err}", path.display()))
             });
 
         match result {
-            Ok((raw, encoding)) => {
+            Ok((raw, encoding, fingerprint)) => {
                 let (text, eol) = Eol::normalize(&raw);
                 self.text = text;
                 self.saved_text = self.text.clone();
                 self.encoding = encoding;
                 self.eol = eol;
+                self.disk_fingerprint = Some(fingerprint);
                 self.path = Some(path.clone());
                 self.last_dir = path.parent().map(Path::to_path_buf);
                 self.revision = self.revision.wrapping_add(1);
@@ -454,6 +523,7 @@ impl EditorApp {
                 self.cursor_line = 1;
                 self.cursor_col = 1;
                 self.selection_len = 0;
+                self.conflict = None;
                 self.reset_editor_state(ctx);
             }
             Err(message) => self.error = Some(message),
@@ -471,15 +541,56 @@ impl EditorApp {
         state.store(ctx, editor_id());
     }
 
-    fn save(&mut self, _ctx: &egui::Context) -> bool {
-        let path = match self.path.clone() {
-            Some(path) => path,
+    fn save(&mut self, ctx: &egui::Context) -> bool {
+        self.save_with(ctx, None)
+    }
+
+    fn save_with(&mut self, ctx: &egui::Context, then: Option<Action>) -> bool {
+        match self.path.clone() {
+            Some(path) => self.save_to_path(ctx, path, true, then),
             None => match self.pick_save() {
-                Some(path) => path,
-                None => return false,
+                Some(path) => self.save_to_path(ctx, path, false, then),
+                None => false,
             },
-        };
+        }
+    }
+
+    fn save_as(&mut self, ctx: &egui::Context) -> bool {
+        match self.pick_save() {
+            Some(path) => self.save_to_path(ctx, path, false, None),
+            None => false,
+        }
+    }
+
+    /// Write the buffer to `path`. With `check_disk`, refuse to overwrite a
+    /// file that no longer matches the fingerprint from the last load or save.
+    ///
+    /// The check is best-effort: another process can still change the file
+    /// between the read and the atomic rename. Closing that race completely
+    /// would need file locking or a compare-and-swap filesystem operation.
+    fn save_to_path(
+        &mut self,
+        ctx: &egui::Context,
+        path: PathBuf,
+        check_disk: bool,
+        then: Option<Action>,
+    ) -> bool {
         let path = absolute(&path);
+
+        if check_disk && let Some(expected) = self.disk_fingerprint {
+            match check_disk_file(&path, expected) {
+                Ok(None) => {}
+                Ok(Some(reason)) => {
+                    self.conflict = Some(SaveConflict { path, reason, then });
+                    ctx.request_repaint();
+                    return false;
+                }
+                Err(message) => {
+                    self.error = Some(message);
+                    return false;
+                }
+            }
+        }
 
         let contents = self.eol.encode(&self.text);
         let bytes = self.encoding.encode(&contents);
@@ -488,6 +599,7 @@ impl EditorApp {
                 self.last_dir = path.parent().map(Path::to_path_buf);
                 self.path = Some(path);
                 self.saved_text.clone_from(&self.text);
+                self.disk_fingerprint = Some(Fingerprint::of(&bytes));
                 true
             }
             Err(err) => {
@@ -629,10 +741,7 @@ impl EditorApp {
                 self.save(ctx);
             }
             Cmd::SaveAs => {
-                if let Some(path) = self.pick_save() {
-                    self.path = Some(path);
-                    self.save(ctx);
-                }
+                self.save_as(ctx);
             }
             Cmd::CopyPath => self.copy_path(ctx),
             Cmd::DeleteLine => self.delete_line(ctx),
@@ -834,10 +943,7 @@ impl EditorApp {
                 self.save(ctx);
             }
             PaletteCommand::SaveAs => {
-                if let Some(path) = self.pick_save() {
-                    self.path = Some(path);
-                    self.save(ctx);
-                }
+                self.save_as(ctx);
             }
             PaletteCommand::Open => self.request(ctx, Action::Open),
             PaletteCommand::Find => self.open_find(ctx),
@@ -1609,8 +1715,8 @@ impl EditorApp {
 
             match choice {
                 Some(Choice::Save) => {
-                    if self.save(ctx) {
-                        let action = self.pending.take().unwrap_or(action);
+                    if self.save_with(ctx, Some(action.clone())) {
+                        self.pending = None;
                         self.run_action(ctx, action);
                     } else {
                         self.pending = None;
@@ -1621,6 +1727,96 @@ impl EditorApp {
                     self.run_action(ctx, action);
                 }
                 Some(Choice::Cancel) => self.pending = None,
+                None => {}
+            }
+        }
+
+        if self.conflict.is_some()
+            && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.conflict = None;
+        }
+
+        if let Some(conflict) = self.conflict.as_ref() {
+            let (heading, message) = match conflict.reason {
+                ConflictReason::Changed => (
+                    "File changed on disk",
+                    "The file was changed by another program since it was opened. \
+                     Saving now would overwrite those changes.",
+                ),
+                ConflictReason::Deleted => (
+                    "File deleted on disk",
+                    "The file was deleted or moved since it was opened.",
+                ),
+            };
+            let mut choice = None;
+            let modal = egui::Modal::new(Id::unique("conflict_modal")).show(ctx, |ui| {
+                ui.set_width(470.0);
+                ui.heading(heading);
+                ui.add_space(4.0);
+                ui.label(RichText::new(message).color(theme::MUTED));
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(conflict.path.display().to_string())
+                        .monospace()
+                        .size(11.0)
+                        .color(theme::FAINT),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    let overwrite = match conflict.reason {
+                        ConflictReason::Changed => "Overwrite",
+                        ConflictReason::Deleted => "Recreate",
+                    };
+                    if primary_button(ui, overwrite).clicked() {
+                        choice = Some(ConflictChoice::Overwrite);
+                    }
+                    if conflict.reason == ConflictReason::Changed && ui.button("Reload").clicked() {
+                        choice = Some(ConflictChoice::Reload);
+                    }
+                    if ui.button("Save As…").clicked() {
+                        choice = Some(ConflictChoice::SaveAs);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(ConflictChoice::Cancel);
+                    }
+                });
+            });
+            if modal.backdrop_response.clicked() {
+                choice = Some(ConflictChoice::Cancel);
+            }
+
+            match choice {
+                Some(ConflictChoice::Overwrite) => {
+                    let SaveConflict { path, then, .. } = self.conflict.take().unwrap();
+                    if self.save_to_path(ctx, path, false, None)
+                        && let Some(action) = then
+                    {
+                        self.run_action(ctx, action);
+                    }
+                }
+                Some(ConflictChoice::Reload) => {
+                    let SaveConflict { path, then, .. } = self.conflict.take().unwrap();
+                    self.load_path(path, ctx);
+                    if self.error.is_none()
+                        && let Some(action) = then
+                    {
+                        self.run_action(ctx, action);
+                    }
+                }
+                Some(ConflictChoice::SaveAs) => {
+                    // Cancelling the file dialog leaves the conflict dialog
+                    // open and the current buffer untouched.
+                    if let Some(path) = self.pick_save() {
+                        let SaveConflict { then, .. } = self.conflict.take().unwrap();
+                        if self.save_to_path(ctx, path, false, None)
+                            && let Some(action) = then
+                        {
+                            self.run_action(ctx, action);
+                        }
+                    }
+                }
+                Some(ConflictChoice::Cancel) => self.conflict = None,
                 None => {}
             }
         }
@@ -1987,5 +2183,58 @@ mod tests {
         assert_eq!(fresh_matches("a", "a", &matches), matches);
         assert!(fresh_matches("é", "a", &matches).is_empty());
         assert!(fresh_matches("ab", "a", &matches).is_empty());
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            loop {
+                let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("mrs-conflict-test-{}-{n}", std::process::id()));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => panic!("cannot create test directory: {err}"),
+                }
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn disk_check_detects_external_changes() {
+        let dir = TempDir::new();
+        let path = dir.path().join("doc.txt");
+        std::fs::write(&path, b"one").unwrap();
+        let expected = Fingerprint::of(b"one");
+
+        assert_eq!(check_disk_file(&path, expected), Ok(None));
+
+        // Same length, different contents.
+        std::fs::write(&path, b"two").unwrap();
+        assert_eq!(
+            check_disk_file(&path, expected),
+            Ok(Some(ConflictReason::Changed))
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            check_disk_file(&path, expected),
+            Ok(Some(ConflictReason::Deleted))
+        );
     }
 }

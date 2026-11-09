@@ -28,6 +28,8 @@ A small, dark, menu-less plain-text editor written in Rust with
 - Absolute path available on demand: hover the file name in the status bar to
   see it, click the name (or press **Ctrl+Shift+C**) to copy it.
 - Preserves line endings and a UTF-8 BOM when saving.
+- Detects files changed or deleted on disk before saving, with overwrite,
+  reload and Save As choices.
 - Adjustable text size (**Ctrl++**, **Ctrl+-**, **Ctrl+0**, also Ctrl+scroll).
 - Asks before discarding unsaved changes.
 
@@ -170,6 +172,7 @@ gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor
 
 - `src/main.rs` – window setup and entry point
 - `src/app.rs` – editor state, UI, shortcuts and file handling
+- `src/save.rs` – atomic file replacement
 - `src/text.rs` – encodings, line endings, statistics and search (unit-tested)
 - `src/theme.rs` – the dark color palette and egui styling
 - `install.sh` – build and install script (user-local, system-wide or custom prefix)
