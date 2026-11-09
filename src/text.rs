@@ -150,8 +150,12 @@ pub fn find_matches(haystack: &str, needle: &str, case_sensitive: bool) -> Vec<R
             start += 1;
             continue;
         }
+        // A candidate whose end lies inside a multibyte character is not a
+        // match, but later boundaries may still be. Skip to the next character
+        // instead of ending the search.
         let Some(candidate) = haystack.get(start..start + needle_len) else {
-            break;
+            start += haystack[start..].chars().next().map_or(1, char::len_utf8);
+            continue;
         };
         let hit = if case_sensitive {
             candidate == needle
@@ -254,5 +258,19 @@ mod tests {
     #[test]
     fn find_respects_char_boundaries() {
         assert_eq!(find_matches("žluť", "luť", true), vec![2..6]);
+    }
+
+    #[test]
+    fn find_skips_candidates_ending_inside_multibyte_characters() {
+        // A one-byte needle after a multibyte prefix: the first candidate ends
+        // inside "é"/"🙂" and must not abort the search.
+        assert_eq!(find_matches("éa", "a", false), vec![2..3]);
+        assert_eq!(find_matches("🙂foo", "foo", true), vec![4..7]);
+    }
+
+    #[test]
+    fn find_continues_past_multibyte_text_between_matches() {
+        assert_eq!(find_matches("aé a🙂a", "a", true), vec![0..1, 4..5, 9..10]);
+        assert_eq!(find_matches("žluť luť", "luť", true), vec![2..6, 7..11]);
     }
 }
