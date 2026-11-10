@@ -13,7 +13,7 @@ A small, dark, menu-less plain-text editor written in Rust with
   cheat sheet).
 - VS Code-style command palette (**Ctrl+Shift+P**) with fuzzy-free filtering and
   commands for new/open/save/save as, find and navigation, copy file path,
-  delete line, zoom, toggles, keyboard shortcuts and quit.
+  delete line, zoom, toggles, keyboard shortcuts, clipboard viewer and quit.
 - Status bar with file name, modified indicator, cursor position, selection
   size, line/word/character counts, line endings (LF/CRLF), encoding
   (UTF-8/UTF-8 BOM) and text zoom.
@@ -166,6 +166,7 @@ gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor
 | Ctrl+Shift+K | Delete the current line |
 | Ctrl++ / Ctrl+- / Ctrl+0 | Larger / smaller / reset text size |
 | F1 | Shortcut help |
+| F2 | Clipboard contents |
 | Esc | Close find/goto bar or a dialog |
 
 ## Layout

@@ -207,6 +207,7 @@ enum PaletteCommand {
     ToggleGuide,
     ToggleStatusBar,
     Help,
+    Clipboard,
 }
 
 struct PaletteEntry {
@@ -297,6 +298,11 @@ const PALETTE_COMMANDS: &[PaletteEntry] = &[
         hint: "F1",
     },
     PaletteEntry {
+        command: PaletteCommand::Clipboard,
+        label: "Show Clipboard",
+        hint: "F2",
+    },
+    PaletteEntry {
         command: PaletteCommand::Quit,
         label: "Quit",
         hint: "Ctrl+Q",
@@ -343,6 +349,9 @@ pub struct EditorApp {
     show_guide: bool,
     show_status_bar: bool,
     show_help: bool,
+    show_clipboard: bool,
+    clipboard_text: String,
+    clipboard_error: Option<String>,
     pending: Option<Action>,
     error: Option<String>,
     conflict: Option<SaveConflict>,
@@ -387,6 +396,9 @@ impl EditorApp {
             show_guide: true,
             show_status_bar: true,
             show_help: false,
+            show_clipboard: false,
+            clipboard_text: String::new(),
+            clipboard_error: None,
             pending: None,
             error: None,
             conflict: None,
@@ -429,6 +441,7 @@ impl EditorApp {
             || self.error.is_some()
             || self.conflict.is_some()
             || self.show_help
+            || self.show_clipboard
             || self.palette.open
     }
 
@@ -681,6 +694,7 @@ impl EditorApp {
             ZoomOut,
             ZoomReset,
             Help,
+            Clipboard,
         }
 
         let mut command = None;
@@ -723,6 +737,8 @@ impl EditorApp {
                 command = Some(Cmd::ZoomReset);
             } else if hit(Modifiers::NONE, Key::F1) {
                 command = Some(Cmd::Help);
+            } else if hit(Modifiers::NONE, Key::F2) {
+                command = Some(Cmd::Clipboard);
             } else if hit(Modifiers::NONE, Key::F3) {
                 command = Some(Cmd::FindNext);
             } else if hit(shift, Key::F3) {
@@ -757,7 +773,33 @@ impl EditorApp {
             Cmd::ZoomOut => self.zoom(-1.0),
             Cmd::ZoomReset => self.reset_zoom(),
             Cmd::Help => self.show_help = !self.show_help,
+            Cmd::Clipboard => self.open_clipboard(ctx),
         }
+    }
+
+    /// Open the clipboard viewer and load the current clipboard contents.
+    fn open_clipboard(&mut self, ctx: &egui::Context) {
+        self.show_clipboard = true;
+        self.load_clipboard(ctx);
+    }
+
+    fn load_clipboard(&mut self, ctx: &egui::Context) {
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+            Ok(text) => {
+                self.clipboard_text = text;
+                self.clipboard_error = None;
+            }
+            // An empty clipboard is not an error worth showing.
+            Err(arboard::Error::ContentNotAvailable) => {
+                self.clipboard_text.clear();
+                self.clipboard_error = None;
+            }
+            Err(err) => {
+                self.clipboard_text.clear();
+                self.clipboard_error = Some(format!("Cannot read the clipboard.\n{err}"));
+            }
+        }
+        ctx.request_repaint();
     }
 
     fn copy_path(&mut self, ctx: &egui::Context) {
@@ -961,6 +1003,7 @@ impl EditorApp {
             PaletteCommand::ToggleGuide => self.show_guide = !self.show_guide,
             PaletteCommand::ToggleStatusBar => self.show_status_bar = !self.show_status_bar,
             PaletteCommand::Help => self.show_help = true,
+            PaletteCommand::Clipboard => self.open_clipboard(ctx),
         }
         ctx.request_repaint();
     }
@@ -1840,6 +1883,73 @@ impl EditorApp {
                 self.show_help = false;
             }
         }
+
+        if self.show_clipboard {
+            let modal_width = (ctx.content_rect().width() - 100.0).clamp(320.0, 760.0);
+            let max_height = (ctx.content_rect().height() * 0.55).clamp(140.0, 520.0);
+            let mut reload = false;
+            let modal = egui::Modal::new(Id::unique("clipboard_modal")).show(ctx, |ui| {
+                ui.set_width(modal_width);
+                ui.heading("Clipboard");
+                ui.add_space(8.0);
+                if let Some(error) = &self.clipboard_error {
+                    ui.label(RichText::new(error).color(theme::ERROR));
+                } else if self.clipboard_text.is_empty() {
+                    ui.label(RichText::new("The clipboard is empty.").color(theme::MUTED));
+                } else {
+                    let (preview, truncated) = clipboard_preview(&self.clipboard_text);
+                    ui.label(
+                        RichText::new(clipboard_summary(&self.clipboard_text))
+                            .size(11.0)
+                            .color(theme::FAINT),
+                    );
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("clipboard_text")
+                        .max_height(max_height)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(preview)
+                                        .font(FontId::monospace(12.5))
+                                        .color(theme::TEXT),
+                                )
+                                .selectable(true)
+                                .wrap(),
+                            );
+                        });
+                    if truncated {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("Only the beginning of the clipboard is shown.")
+                                .size(11.0)
+                                .color(theme::FAINT),
+                        );
+                    }
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Read again").clicked() {
+                        reload = true;
+                    }
+                    ui.label(
+                        RichText::new("F2 or Esc closes")
+                            .size(11.0)
+                            .color(theme::FAINT),
+                    );
+                });
+            });
+            if reload {
+                self.load_clipboard(ctx);
+            }
+            if modal.backdrop_response.clicked()
+                || ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+                || ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F2))
+            {
+                self.show_clipboard = false;
+            }
+        }
     }
 
     fn drop_overlay(&self, ctx: &egui::Context) {
@@ -1947,6 +2057,25 @@ fn absolute(path: &Path) -> PathBuf {
 
 fn zoom_percent(font_size: f32) -> f32 {
     (font_size / BASE_FONT_SIZE * 100.0).round()
+}
+
+/// Largest clipboard shown in the viewer; huge clipboards would otherwise
+/// make the modal's text layout very expensive.
+const CLIPBOARD_PREVIEW_LIMIT: usize = 200_000;
+
+fn clipboard_preview(text: &str) -> (&str, bool) {
+    match text.char_indices().nth(CLIPBOARD_PREVIEW_LIMIT) {
+        Some((byte, _)) => (&text[..byte], true),
+        None => (text, false),
+    }
+}
+
+fn clipboard_summary(text: &str) -> String {
+    format!(
+        "{} lines · {} characters",
+        text.lines().count(),
+        text.chars().count()
+    )
 }
 
 fn text_file_dialog() -> rfd::FileDialog {
@@ -2089,6 +2218,7 @@ const SHORTCUTS: &[(&[&str], &str)] = &[
     (&["Shift+F3"], "Find previous"),
     (&["Ctrl+L"], "Go to line"),
     (&["F1"], "This help"),
+    (&["F2"], "Clipboard contents"),
     (&["Esc"], "Close find / go to line"),
     (&["Ctrl+Z"], "Undo"),
     (&["Ctrl+Y"], "Redo"),
@@ -2178,6 +2308,24 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_preview_never_splits_a_character() {
+        let text = "é".repeat(CLIPBOARD_PREVIEW_LIMIT + 10);
+        let (preview, truncated) = clipboard_preview(&text);
+        assert!(truncated);
+        assert_eq!(preview.chars().count(), CLIPBOARD_PREVIEW_LIMIT);
+
+        let (preview, truncated) = clipboard_preview("short");
+        assert_eq!(preview, "short");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn clipboard_summary_counts_lines_and_characters() {
+        assert_eq!(clipboard_summary(""), "0 lines · 0 characters");
+        assert_eq!(clipboard_summary("a\nb\n"), "2 lines · 4 characters");
+    }
+
+    #[test]
     fn matches_are_dropped_when_the_buffer_changed() {
         let matches = [Range { start: 0, end: 1 }];
         assert_eq!(fresh_matches("a", "a", &matches), matches);
@@ -2239,6 +2387,9 @@ mod tests {
             show_guide: true,
             show_status_bar: true,
             show_help: false,
+            show_clipboard: false,
+            clipboard_text: String::new(),
+            clipboard_error: None,
             pending: None,
             error: None,
             conflict: None,
