@@ -22,6 +22,13 @@ const APP_NAME: &str = "mrs";
 const EDITOR_ID: &str = "mrs.editor";
 const GUIDE_COLUMN: f32 = 80.0;
 const BASE_FONT_SIZE: f32 = 15.0;
+/// Editor line height as a multiple of the font size. Kept a little above the
+/// font's natural row height so lines breathe.
+const EDITOR_LINE_SPACING: f32 = 1.35;
+
+fn editor_line_height(font_size: f32) -> f32 {
+    font_size * EDITOR_LINE_SPACING
+}
 
 fn editor_id() -> Id {
     Id::unique(EDITOR_ID)
@@ -1468,7 +1475,8 @@ impl EditorApp {
                 visuals.widgets.active.fg_stroke.color = theme::SCROLL_HANDLE_HOVER;
 
                 let font_id = FontId::monospace(self.font_size);
-                let row_height = ctx.fonts_mut(|fonts| fonts.row_height(&font_id));
+                let row_height = editor_line_height(self.font_size)
+                    .max(ctx.fonts_mut(|fonts| fonts.row_height(&font_id)));
                 let rows = ((inner.height() / row_height).floor() as usize).max(3);
 
                 if self.focus_editor {
@@ -1494,23 +1502,14 @@ impl EditorApp {
                         &[]
                     };
                     ui.fonts_mut(|fonts| {
-                        if matches.is_empty() {
-                            fonts.layout(
-                                buffer.as_str().to_owned(),
-                                layouter_font.clone(),
-                                layouter_color,
-                                wrap_width,
-                            )
-                        } else {
-                            fonts.layout_job(build_job(
-                                buffer.as_str(),
-                                matches,
-                                current_match,
-                                &layouter_font,
-                                layouter_color,
-                                wrap_width,
-                            ))
-                        }
+                        fonts.layout_job(build_job(
+                            buffer.as_str(),
+                            matches,
+                            current_match,
+                            &layouter_font,
+                            layouter_color,
+                            wrap_width,
+                        ))
                     })
                 };
 
@@ -2050,6 +2049,7 @@ fn build_job(
     let base = egui::text::TextFormat {
         font_id: font_id.clone(),
         color,
+        line_height: Some(editor_line_height(font_id.size)),
         ..Default::default()
     };
 
@@ -2171,6 +2171,16 @@ mod tests {
         let job = job("abc", &[range(2, 1), range(1, 99)]);
         assert_eq!(job.text, "abc");
         assert_eq!(byte_ranges(&job), vec![range(0, 3)]);
+    }
+
+    #[test]
+    fn every_section_uses_the_widened_line_height() {
+        let job = job("aéb", &[range(1, 3)]);
+        let expected = editor_line_height(12.0);
+        assert_eq!(job.sections.len(), 3);
+        for section in &job.sections {
+            assert_eq!(section.format.line_height, Some(expected));
+        }
     }
 
     #[test]
