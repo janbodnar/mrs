@@ -50,6 +50,39 @@ enum Choice {
     Cancel,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickerMode {
+    Open,
+    Save,
+}
+
+#[derive(Clone, Debug)]
+struct PickerEntry {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+}
+
+/// The in-app replacement for the platform file dialogs. The path field at the
+/// top doubles as a quick jump: typing a folder navigates there, typing a file
+/// opens it (or fills in the name in save mode).
+struct FilePicker {
+    mode: PickerMode,
+    dir: PathBuf,
+    path_input: String,
+    name_input: String,
+    entries: Vec<PickerEntry>,
+    selected: Option<usize>,
+    error: Option<String>,
+    /// Save mode only: the target already exists, so a second confirmation is
+    /// required before replacing it.
+    overwrite_armed: bool,
+    scroll_to_selected: bool,
+    /// Action to run after a successful save (Save, then Quit/Open, etc.).
+    then: Option<Action>,
+    focus_name: bool,
+}
+
 /// Cheap identity for the bytes last read from or written to disk. A save is
 /// refused when the file on disk no longer has this fingerprint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -352,6 +385,7 @@ pub struct EditorApp {
     show_clipboard: bool,
     clipboard_text: String,
     clipboard_error: Option<String>,
+    file_picker: Option<FilePicker>,
     pending: Option<Action>,
     error: Option<String>,
     conflict: Option<SaveConflict>,
@@ -365,6 +399,83 @@ pub struct EditorApp {
     restore_pending: bool,
     title: String,
     last_dir: Option<PathBuf>,
+}
+
+impl FilePicker {
+    fn new(mode: PickerMode, dir: PathBuf, name: String, then: Option<Action>) -> Self {
+        let mut picker = Self {
+            mode,
+            path_input: dir.display().to_string(),
+            dir,
+            name_input: name,
+            entries: Vec::new(),
+            selected: None,
+            error: None,
+            overwrite_armed: false,
+            scroll_to_selected: false,
+            then,
+            focus_name: mode == PickerMode::Save,
+        };
+        picker.reload();
+        picker
+    }
+
+    fn navigate(&mut self, dir: PathBuf) {
+        self.dir = absolute(&dir);
+        self.path_input = self.dir.display().to_string();
+        self.selected = None;
+        self.overwrite_armed = false;
+        self.error = None;
+        self.reload();
+    }
+
+    fn reload(&mut self) {
+        match read_directory(&self.dir) {
+            Ok(entries) => {
+                self.entries = entries;
+                self.error = None;
+            }
+            Err(message) => {
+                self.entries.clear();
+                self.error = Some(message);
+            }
+        }
+        self.selected = None;
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let last = self.entries.len() - 1;
+        let next = match self.selected {
+            None if delta < 0 => last,
+            None => 0,
+            Some(current) => (current as isize + delta).clamp(0, last as isize) as usize,
+        };
+        self.selected = Some(next);
+        self.scroll_to_selected = true;
+        self.overwrite_armed = false;
+        if self.mode == PickerMode::Save
+            && let Some(entry) = self.entries.get(next)
+            && !entry.is_dir
+        {
+            self.name_input.clone_from(&entry.name);
+        }
+    }
+
+    /// The file to write in save mode, resolved against the current folder.
+    fn save_target(&self) -> Result<PathBuf, String> {
+        let name = self.name_input.trim();
+        if name.is_empty() {
+            return Err("Enter a file name.".to_owned());
+        }
+        let path = resolve_picker_path(&self.dir, name);
+        if path.is_dir() {
+            return Err(format!("“{}” is a folder.", path.display()));
+        }
+        Ok(path)
+    }
 }
 
 impl EditorApp {
@@ -399,6 +510,7 @@ impl EditorApp {
             show_clipboard: false,
             clipboard_text: String::new(),
             clipboard_error: None,
+            file_picker: None,
             pending: None,
             error: None,
             conflict: None,
@@ -442,6 +554,7 @@ impl EditorApp {
             || self.conflict.is_some()
             || self.show_help
             || self.show_clipboard
+            || self.file_picker.is_some()
             || self.palette.open
     }
 
@@ -474,11 +587,7 @@ impl EditorApp {
     fn run_action(&mut self, ctx: &egui::Context, action: Action) {
         match action {
             Action::New => self.new_file(ctx),
-            Action::Open => {
-                if let Some(path) = self.pick_open() {
-                    self.load_path(path, ctx);
-                }
-            }
+            Action::Open => self.open_picker(ctx, PickerMode::Open, None),
             Action::OpenPath(path) => self.load_path(path, ctx),
             Action::Quit => {
                 self.allow_close = true;
@@ -568,18 +677,16 @@ impl EditorApp {
     fn save_with(&mut self, ctx: &egui::Context, then: Option<Action>) -> bool {
         match self.path.clone() {
             Some(path) => self.save_to_path(ctx, path, true, then),
-            None => match self.pick_save() {
-                Some(path) => self.save_to_path(ctx, path, false, then),
-                None => false,
-            },
+            None => {
+                self.open_picker(ctx, PickerMode::Save, then);
+                false
+            }
         }
     }
 
     fn save_as(&mut self, ctx: &egui::Context) -> bool {
-        match self.pick_save() {
-            Some(path) => self.save_to_path(ctx, path, false, None),
-            None => false,
-        }
+        self.open_picker(ctx, PickerMode::Save, None);
+        false
     }
 
     /// Write the buffer to `path`. With `check_disk`, refuse to overwrite a
@@ -629,31 +736,32 @@ impl EditorApp {
         }
     }
 
-    fn pick_open(&mut self) -> Option<PathBuf> {
-        let mut dialog = text_file_dialog();
-        if let Some(dir) = &self.last_dir {
-            dialog = dialog.set_directory(dir);
-        }
-        let path = dialog.pick_file();
-        if let Some(path) = &path {
-            self.last_dir = path.parent().map(Path::to_path_buf);
-        }
-        path
-    }
+    fn open_picker(&mut self, ctx: &egui::Context, mode: PickerMode, then: Option<Action>) {
+        let dir = self
+            .last_dir
+            .clone()
+            .filter(|dir| dir.is_dir())
+            .or_else(|| {
+                self.path
+                    .as_ref()
+                    .and_then(|path| path.parent())
+                    .map(Path::to_path_buf)
+            })
+            .or_else(home_directory)
+            .unwrap_or_else(|| PathBuf::from("/"));
 
-    fn pick_save(&mut self) -> Option<PathBuf> {
-        let suggested = self
-            .path
-            .as_ref()
-            .and_then(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "untitled.txt".to_owned());
+        let name = if mode == PickerMode::Save {
+            self.path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "untitled.txt".to_owned())
+        } else {
+            String::new()
+        };
 
-        let mut dialog = text_file_dialog().set_file_name(suggested);
-        if let Some(dir) = &self.last_dir {
-            dialog = dialog.set_directory(dir);
-        }
-        dialog.save_file()
+        self.file_picker = Some(FilePicker::new(mode, dir, name, then));
+        ctx.request_repaint();
     }
 
     fn reset_zoom(&mut self) {
@@ -1747,11 +1855,13 @@ impl EditorApp {
 
             match choice {
                 Some(Choice::Save) => {
-                    if self.save_with(ctx, Some(action.clone())) {
-                        self.pending = None;
-                        self.run_action(ctx, action);
+                    self.pending = None;
+                    if self.path.is_some() {
+                        if self.save_with(ctx, Some(action.clone())) {
+                            self.run_action(ctx, action);
+                        }
                     } else {
-                        self.pending = None;
+                        self.open_picker(ctx, PickerMode::Save, Some(action));
                     }
                 }
                 Some(Choice::Discard) => {
@@ -1837,16 +1947,12 @@ impl EditorApp {
                     }
                 }
                 Some(ConflictChoice::SaveAs) => {
-                    // Cancelling the file dialog leaves the conflict dialog
-                    // open and the current buffer untouched.
-                    if let Some(path) = self.pick_save() {
-                        let SaveConflict { then, .. } = self.conflict.take().unwrap();
-                        if self.save_to_path(ctx, path, false, None)
-                            && let Some(action) = then
-                        {
-                            self.run_action(ctx, action);
-                        }
-                    }
+                    // Moving the pending action into the picker keeps the
+                    // unsaved-changes flow going. Cancelling the picker leaves
+                    // the buffer untouched; a later save reports the conflict
+                    // again.
+                    let SaveConflict { then, .. } = self.conflict.take().unwrap();
+                    self.open_picker(ctx, PickerMode::Save, then);
                 }
                 Some(ConflictChoice::Cancel) => self.conflict = None,
                 None => {}
@@ -1952,6 +2058,347 @@ impl EditorApp {
         }
     }
 
+    fn file_picker_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut picker) = self.file_picker.take() else {
+            return;
+        };
+
+        let path_id = Id::unique("file_picker_path");
+        let name_id = Id::unique("file_picker_name");
+        let mode = picker.mode;
+        let modal_width = (ctx.content_rect().width() - 100.0).clamp(360.0, 660.0);
+        let list_height = (ctx.content_rect().height() - 230.0).clamp(90.0, 340.0);
+        let mut chosen: Option<PathBuf> = None;
+        let mut confirm = false;
+        let mut cancel = false;
+
+        // Keyboard is handled before the widgets are drawn so the list keeps
+        // the arrows while the path and name fields use them for text editing.
+        let (path_focused, name_focused) =
+            ctx.memory(|memory| (memory.has_focus(path_id), memory.has_focus(name_id)));
+        if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+            cancel = true;
+        }
+        let enter = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
+
+        if !path_focused && !name_focused {
+            if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                picker.move_selection(1);
+            }
+            if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                picker.move_selection(-1);
+            }
+        }
+
+        if enter {
+            if path_focused {
+                let typed = resolve_picker_path(&picker.dir, &picker.path_input);
+                if typed.is_dir() {
+                    picker.navigate(typed);
+                } else if typed.is_file() {
+                    if mode == PickerMode::Save {
+                        if let (Some(parent), Some(name)) = (typed.parent(), typed.file_name()) {
+                            picker.navigate(parent.to_path_buf());
+                            picker.name_input = name.to_string_lossy().into_owned();
+                            picker.focus_name = true;
+                        }
+                    } else {
+                        chosen = Some(typed);
+                        confirm = true;
+                    }
+                } else if mode == PickerMode::Save {
+                    let parent = typed.parent().filter(|parent| parent.is_dir());
+                    match (parent, typed.file_name()) {
+                        (Some(parent), Some(name)) => {
+                            picker.navigate(parent.to_path_buf());
+                            picker.name_input = name.to_string_lossy().into_owned();
+                            picker.focus_name = true;
+                        }
+                        _ => {
+                            picker.error =
+                                Some(format!("No such file or folder: {}", typed.display()));
+                        }
+                    }
+                } else {
+                    picker.error = Some(format!("No such file or folder: {}", typed.display()));
+                }
+            } else if name_focused {
+                confirm = true;
+            } else {
+                let selected = picker.selected.and_then(|index| {
+                    picker
+                        .entries
+                        .get(index)
+                        .map(|entry| (entry.path.clone(), entry.is_dir))
+                });
+                match selected {
+                    Some((path, true)) => picker.navigate(path),
+                    Some((path, false)) => {
+                        chosen = Some(path);
+                        confirm = true;
+                    }
+                    None if mode == PickerMode::Save => confirm = true,
+                    None => {
+                        let typed = resolve_picker_path(&picker.dir, &picker.path_input);
+                        if typed.is_file() {
+                            chosen = Some(typed);
+                            confirm = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let modal = egui::Modal::new(Id::unique("file_picker_modal")).show(ctx, |ui| {
+            ui.set_width(modal_width);
+            ui.heading(match mode {
+                PickerMode::Open => "Open file",
+                PickerMode::Save => "Save as",
+            });
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                let parent = picker.dir.parent().map(Path::to_path_buf);
+                if ui
+                    .add_enabled(parent.is_some(), egui::Button::new("Up"))
+                    .clicked()
+                    && let Some(parent) = parent
+                {
+                    picker.navigate(parent);
+                }
+
+                let path_width = (ui.available_width() - 90.0).max(120.0);
+                let response = ui.add(
+                    TextEdit::singleline(&mut picker.path_input)
+                        .id(path_id)
+                        .desired_width(path_width)
+                        .margin(Margin::symmetric(8, 4))
+                        .font(FontId::monospace(12.5))
+                        .hint_text("path"),
+                );
+                if response.changed() {
+                    picker.error = None;
+                    picker.overwrite_armed = false;
+                }
+                if ui.button("Refresh").clicked() {
+                    picker.reload();
+                }
+            });
+
+            if mode == PickerMode::Save {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Name").size(11.5).color(theme::MUTED));
+                    let width = (ui.available_width() - 6.0).max(140.0);
+                    let response = ui.add(
+                        TextEdit::singleline(&mut picker.name_input)
+                            .id(name_id)
+                            .desired_width(width)
+                            .margin(Margin::symmetric(8, 4))
+                            .font(FontId::proportional(13.0))
+                            .hint_text("file name"),
+                    );
+                    if response.changed() {
+                        picker.error = None;
+                        picker.overwrite_armed = false;
+                    }
+                    if picker.focus_name {
+                        response.request_focus();
+                        picker.focus_name = false;
+                    }
+                });
+            }
+
+            ui.add_space(8.0);
+            let error = picker.error.clone();
+            egui::Frame::NONE
+                .fill(theme::INPUT_BG)
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(4, 4))
+                .show(ui, |ui| {
+                    if let Some(error) = &error {
+                        ui.label(RichText::new(error).size(12.0).color(theme::ERROR));
+                    }
+                    if picker.entries.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("This folder is empty.")
+                                .size(12.0)
+                                .color(theme::MUTED),
+                        );
+                        return;
+                    }
+
+                    let row_height = 22.0;
+                    let spacing = 2.0;
+                    ui.spacing_mut().item_spacing.y = spacing;
+                    let mut scroll = egui::ScrollArea::vertical()
+                        .id_salt("file_picker_list")
+                        .max_height(list_height)
+                        .auto_shrink([false, false]);
+                    if picker.scroll_to_selected
+                        && let Some(selected) = picker.selected
+                    {
+                        let offset =
+                            (selected as f32 * (row_height + spacing) - list_height * 0.5).max(0.0);
+                        scroll = scroll.vertical_scroll_offset(offset);
+                        picker.scroll_to_selected = false;
+                    }
+
+                    scroll.show_rows(ui, row_height, picker.entries.len(), |ui, range| {
+                        for index in range {
+                            let (name, path, is_dir) = {
+                                let entry = &picker.entries[index];
+                                (entry.name.clone(), entry.path.clone(), entry.is_dir)
+                            };
+                            let label = if is_dir {
+                                format!("{name}/")
+                            } else {
+                                name.clone()
+                            };
+                            let color = if is_hidden(&name) {
+                                theme::FAINT
+                            } else {
+                                theme::TEXT
+                            };
+                            let selected = picker.selected == Some(index);
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), row_height),
+                                egui::Sense::click(),
+                            );
+                            if response.hovered() || selected {
+                                let fill = if selected {
+                                    theme::SELECTION
+                                } else {
+                                    theme::HOVER_BG
+                                };
+                                ui.painter()
+                                    .rect_filled(rect, egui::CornerRadius::same(4), fill);
+                            }
+                            ui.painter().text(
+                                rect.left_center() + vec2(8.0, 0.0),
+                                Align2::LEFT_CENTER,
+                                label,
+                                FontId::proportional(13.0),
+                                color,
+                            );
+                            let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                            if response.clicked() {
+                                if is_dir {
+                                    picker.navigate(path);
+                                    break;
+                                }
+                                picker.selected = Some(index);
+                                picker.overwrite_armed = false;
+                                if mode == PickerMode::Save {
+                                    picker.name_input.clone_from(&name);
+                                }
+                            }
+                            if response.double_clicked() && !is_dir {
+                                chosen = Some(path);
+                                confirm = true;
+                                break;
+                            }
+                        }
+                    });
+                });
+
+            ui.add_space(10.0);
+            if picker.overwrite_armed {
+                ui.label(
+                    RichText::new("That file already exists. Press Save again to replace it.")
+                        .size(11.0)
+                        .color(theme::MODIFIED),
+                );
+                ui.add_space(4.0);
+            }
+            ui.horizontal(|ui| {
+                let label = match (mode, picker.overwrite_armed) {
+                    (PickerMode::Open, _) => "Open",
+                    (PickerMode::Save, true) => "Replace",
+                    (PickerMode::Save, false) => "Save",
+                };
+                if primary_button(ui, label).clicked() {
+                    confirm = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("Enter confirms · Esc closes")
+                            .size(11.0)
+                            .color(theme::FAINT),
+                    );
+                });
+            });
+        });
+
+        if cancel || modal.backdrop_response.clicked() {
+            ctx.request_repaint();
+            return;
+        }
+        if !confirm {
+            self.file_picker = Some(picker);
+            return;
+        }
+
+        let target = match mode {
+            PickerMode::Open => chosen.or_else(|| {
+                picker
+                    .selected
+                    .and_then(|index| picker.entries.get(index))
+                    .filter(|entry| !entry.is_dir)
+                    .map(|entry| entry.path.clone())
+                    .or_else(|| {
+                        let typed = resolve_picker_path(&picker.dir, &picker.path_input);
+                        typed.is_file().then_some(typed)
+                    })
+            }),
+            PickerMode::Save => match picker.save_target() {
+                Ok(path) => Some(path),
+                Err(message) => {
+                    picker.error = Some(message);
+                    picker.overwrite_armed = false;
+                    self.file_picker = Some(picker);
+                    ctx.request_repaint();
+                    return;
+                }
+            },
+        };
+
+        let Some(target) = target else {
+            self.file_picker = Some(picker);
+            return;
+        };
+
+        match mode {
+            PickerMode::Open => {
+                self.last_dir = target.parent().map(Path::to_path_buf);
+                self.load_path(target, ctx);
+            }
+            PickerMode::Save => {
+                if target.exists()
+                    && Some(target.as_path()) != self.path.as_deref()
+                    && !picker.overwrite_armed
+                {
+                    picker.overwrite_armed = true;
+                    self.file_picker = Some(picker);
+                    ctx.request_repaint();
+                    return;
+                }
+                let then = picker.then.take();
+                if self.save_to_path(ctx, target, false, then.clone())
+                    && let Some(action) = then
+                {
+                    self.run_action(ctx, action);
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
     fn drop_overlay(&self, ctx: &egui::Context) {
         if ctx.input(|input| input.raw.hovered_files.is_empty()) {
             return;
@@ -2031,6 +2478,7 @@ impl eframe::App for EditorApp {
         self.prompt_bar(ui);
         self.editor_ui(ui);
         self.dialogs(&ctx);
+        self.file_picker_ui(&ctx);
         self.palette_ui(&ctx);
         self.drop_overlay(&ctx);
         self.notice_ui(&ctx);
@@ -2053,6 +2501,12 @@ impl eframe::App for EditorApp {
 
 fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
 }
 
 fn zoom_percent(font_size: f32) -> f32 {
@@ -2078,16 +2532,58 @@ fn clipboard_summary(text: &str) -> String {
     )
 }
 
-fn text_file_dialog() -> rfd::FileDialog {
-    rfd::FileDialog::new()
-        .add_filter(
-            "Text files",
-            &[
-                "txt", "md", "markdown", "rs", "toml", "json", "yaml", "yml", "log", "csv", "ini",
-                "conf", "cfg", "sh", "py", "c", "h", "cpp", "html", "css", "js", "xml",
-            ],
-        )
-        .add_filter("All files", &["*"])
+fn read_directory(dir: &Path) -> Result<Vec<PickerEntry>, String> {
+    let reader =
+        std::fs::read_dir(dir).map_err(|err| format!("Cannot read “{}”.\n{err}", dir.display()))?;
+    let mut entries = Vec::new();
+    for item in reader.flatten() {
+        let path = item.path();
+        let name = item.file_name().to_string_lossy().into_owned();
+        let is_dir = item
+            .file_type()
+            .map(|kind| kind.is_dir() || (kind.is_symlink() && path.is_dir()))
+            .unwrap_or(false);
+        entries.push(PickerEntry { name, path, is_dir });
+    }
+    sort_entries(&mut entries);
+    Ok(entries)
+}
+
+/// Folders first, then files, each alphabetically and case-insensitively.
+fn sort_entries(entries: &mut [PickerEntry]) {
+    entries.sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
+}
+
+/// Resolve what the user typed in the path or name field. Leading `~` is
+/// expanded and relative paths are taken from `dir`.
+fn resolve_picker_path(dir: &Path, input: &str) -> PathBuf {
+    let input = input.trim();
+    let expanded = if input == "~" || input.starts_with("~/") {
+        match std::env::var_os("HOME") {
+            Some(home) => {
+                let mut path = PathBuf::from(home);
+                if let Some(rest) = input.strip_prefix("~/") {
+                    path.push(rest);
+                }
+                path
+            }
+            None => PathBuf::from(input),
+        }
+    } else {
+        PathBuf::from(input)
+    };
+
+    if expanded.as_os_str().is_empty() {
+        absolute(dir)
+    } else if expanded.is_absolute() {
+        absolute(&expanded)
+    } else {
+        absolute(&dir.join(expanded))
+    }
+}
+
+fn is_hidden(name: &str) -> bool {
+    name.starts_with('.')
 }
 
 fn status_item(ui: &mut Ui, text: &str, color: Color32) {
@@ -2325,6 +2821,68 @@ mod tests {
         assert_eq!(clipboard_summary("a\nb\n"), "2 lines · 4 characters");
     }
 
+    fn picker_entry(name: &str, is_dir: bool) -> PickerEntry {
+        PickerEntry {
+            name: name.to_owned(),
+            path: PathBuf::from(name),
+            is_dir,
+        }
+    }
+
+    #[test]
+    fn picker_lists_folders_first_case_insensitively() {
+        let mut entries = vec![
+            picker_entry("beta.txt", false),
+            picker_entry("Alpha", true),
+            picker_entry("a.txt", false),
+            picker_entry("beta", true),
+        ];
+        sort_entries(&mut entries);
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["Alpha", "beta", "a.txt", "beta.txt"]);
+    }
+
+    #[test]
+    fn picker_paths_resolve_against_the_current_folder() {
+        let dir = Path::new("/tmp/notes");
+        assert_eq!(
+            resolve_picker_path(dir, "todo.txt"),
+            PathBuf::from("/tmp/notes/todo.txt")
+        );
+        assert_eq!(
+            resolve_picker_path(dir, "/etc/hosts"),
+            PathBuf::from("/etc/hosts")
+        );
+        assert_eq!(resolve_picker_path(dir, "   "), PathBuf::from("/tmp/notes"));
+    }
+
+    #[test]
+    fn picker_save_target_requires_a_name_and_rejects_folders() {
+        let dir = TempDir::new();
+        let mut picker = FilePicker {
+            mode: PickerMode::Save,
+            dir: dir.path().to_path_buf(),
+            path_input: dir.path().display().to_string(),
+            name_input: "   ".to_owned(),
+            entries: Vec::new(),
+            selected: None,
+            error: None,
+            overwrite_armed: false,
+            scroll_to_selected: false,
+            then: None,
+            focus_name: false,
+        };
+
+        assert!(picker.save_target().is_err());
+
+        picker.name_input = "notes.txt".to_owned();
+        assert_eq!(picker.save_target().unwrap(), dir.path().join("notes.txt"));
+
+        std::fs::create_dir(dir.path().join("folder")).unwrap();
+        picker.name_input = "folder".to_owned();
+        assert!(picker.save_target().is_err());
+    }
+
     #[test]
     fn matches_are_dropped_when_the_buffer_changed() {
         let matches = [Range { start: 0, end: 1 }];
@@ -2390,6 +2948,7 @@ mod tests {
             show_clipboard: false,
             clipboard_text: String::new(),
             clipboard_error: None,
+            file_picker: None,
             pending: None,
             error: None,
             conflict: None,

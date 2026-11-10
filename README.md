@@ -11,6 +11,8 @@ A small, dark, menu-less plain-text editor written in Rust with
   guide line.
 - No menu bar. Everything is done with keyboard shortcuts (press **F1** for a
   cheat sheet).
+- Built-in file browser for Open and Save As that matches the editor's theme:
+  type a path or browse folders with the arrow keys and **Enter**.
 - VS Code-style command palette (**Ctrl+Shift+P**) with fuzzy-free filtering and
   commands for new/open/save/save as, find and navigation, copy file path,
   delete line, zoom, toggles, keyboard shortcuts, clipboard viewer and quit.
@@ -40,8 +42,8 @@ cargo run --release
 cargo run --release -- path/to/file.txt
 ```
 
-Requires a Rust toolchain (edition 2024). On Linux, the file dialogs use the
-XDG desktop portal, with `zenity` as a fallback.
+Requires a Rust toolchain (edition 2024). File dialogs are drawn by the app
+itself, so no desktop portal, GTK or `zenity` is needed.
 
 ## Install
 
