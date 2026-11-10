@@ -1445,20 +1445,14 @@ impl EditorApp {
                 self.editor_panel_rect = panel_rect;
 
                 let painter = ui.painter();
-                let shadow = egui::epaint::Shadow {
-                    offset: [0, 8],
-                    blur: 28,
-                    spread: 0,
-                    color: Color32::from_black_alpha(90),
-                };
-                painter.add(shadow.as_shape(panel_rect, egui::CornerRadius::same(10)));
+                let radius = egui::CornerRadius::same(4);
                 painter.rect_stroke(
                     panel_rect,
-                    egui::CornerRadius::same(10),
+                    radius,
                     Stroke::new(1.0, theme::BORDER),
                     egui::StrokeKind::Inside,
                 );
-                painter.rect_filled(panel_rect, egui::CornerRadius::same(10), theme::EDITOR_BG);
+                painter.rect_filled(panel_rect, radius, theme::EDITOR_BG);
 
                 let inner = panel_rect.shrink2(vec2(18.0, 12.0));
                 let mut editor_ui = ui.new_child(
